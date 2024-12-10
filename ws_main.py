@@ -2,6 +2,7 @@ import torch
 from watermark.auto_watermark import AutoWatermark
 from utils.transformers_config import TransformersConfig
 from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import RobertaTokenizer, RobertaForSequenceClassification
 import json
 import os
 import trl
@@ -10,6 +11,7 @@ import random
 import pandas as pd
 from datasets import Dataset, load_from_disk, load_dataset
 import openai
+from sentence_transformers import SentenceTransformer
 
 # Device configuration
 device = "cuda:7" if torch.cuda.is_available() else "cpu"
@@ -152,10 +154,10 @@ def process_prompt_dataset(dataset_path: str, num_prompts: int):
         prompt = generate_non_toxic_paraphrase(prompt)
 
         # Generate watermarked and unwatermarked text
-        watermarked_responses, unwatermarked_response = generate_watermarked_and_unwatermarked_text(prompt, num_samples=3, model_name='Qwen/Qwen2.5-3B')
+        watermarked_responses, unwatermarked_response = generate_watermarked_and_unwatermarked_text(prompt, num_samples=1, model_name='Qwen/Qwen2.5-3B')
 
         # Generate paraphrased responses
-        paraphrased_responses = paraphrase_using_hf_model(unwatermarked_response, watermarked_responses, num_samples=64, model_name='Qwen/Qwen2.5-3B-Instruct')
+        paraphrased_responses = paraphrase_using_hf_model(unwatermarked_response, watermarked_responses, num_samples=16, model_name='Qwen/Qwen2.5-3B-Instruct')
 
         # Evaluate paraphrases
         evaluation_results = evaluate_paraphrases(unwatermarked_response, paraphrased_responses)
@@ -204,7 +206,7 @@ def process_prompt_dataset(dataset_path: str, num_prompts: int):
     print(f"Created DPO dataset with {len(dpo_training_data)} samples")
 
 # Joint training function for DPO and SFT
-def train_model(dataset_path: str, model_name: str, training_type: str, num_epochs: int = 3, batch_size: int = 4):
+def train_model(dataset_path: str, model_name: str, training_type: str, num_epochs: int = 3, batch_size: int = 1):
     model = AutoModelForCausalLM.from_pretrained(model_name).to(device)
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
@@ -241,17 +243,17 @@ def train_model(dataset_path: str, model_name: str, training_type: str, num_epoc
 def evaluate_paraphrases(original_text: str, paraphrases: List[str]) -> List[dict]:
     evaluation_metrics = []
     for paraphrase in paraphrases:
-        similarity_score = evaluate_text_similarity(original_text, paraphrase)
+        similarity_score = evaluate_text_similarity_hf(original_text, paraphrase)
         watermark_detector = load_watermark(load_transformers_config('Qwen/Qwen2.5-3B'))
-        is_watermarked = watermark_detector.detect_watermark(paraphrase)['is_watermarked']
+        is_watermarked = watermark_detector.detect_watermark(paraphrase)['score']
         evaluation_metrics.append({
             'similarity_score': similarity_score,
-            'is_watermarked': is_watermarked
+            'p_value': is_watermarked
         })
     return evaluation_metrics
 
 # Evaluate semantic similarity between two texts
-def evaluate_text_similarity(text1: str, text2: str) -> float:
+def evaluate_text_similarity_gpt(text1: str, text2: str) -> float:
     response = openai.ChatCompletion.create(
         model="gpt-4",
         messages=[
@@ -261,22 +263,41 @@ def evaluate_text_similarity(text1: str, text2: str) -> float:
     )
     return float(response['choices'][0]['message']['content'].strip())
 
+# Evaluate text similarity using SentenceTransformers
+def evaluate_text_similarity_hf(text1: str, text2: str) -> float:
+    model = SentenceTransformer('paraphrase-MiniLM-L6-v2')
+    embeddings = model.encode([text1, text2])
+    similarity_score = torch.nn.functional.cosine_similarity(
+        torch.tensor(embeddings[0]).unsqueeze(0),
+        torch.tensor(embeddings[1]).unsqueeze(0)
+    ).item()
+    return similarity_score
+
 # Evaluate text toxicity
-def evaluate_text_toxicity(text: str) -> float:
+def evaluate_text_toxicity_gpt(text: str) -> int:
     response = openai.ChatCompletion.create(
         model="gpt-4",
         messages=[
             {"role": "user", "content": f"Rate the toxicity of the following text on a scale from 0 to 1:\nText: {text}\nToxicity score:"}
         ],
-        max_tokens=4
+        max_tokens=1
     )
-    return float(response['choices'][0]['message']['content'].strip())
+    return int(response['choices'][0]['message']['content'].strip())
+
+def evaluate_text_toxicity_hf(text: str) -> float:
+    tokenizer = RobertaTokenizer.from_pretrained('s-nlp/roberta_toxicity_classifier')
+    model = RobertaForSequenceClassification.from_pretrained('s-nlp/roberta_toxicity_classifier')
+
+    batch = tokenizer.encode(text, return_tensors="pt")
+
+    output = model(batch)
+    return int(torch.argmax(output))
 
 if __name__ == "__main__":
     # Ensure to export your OpenAI key before running this script.
     # Example: export OPENAI_API_KEY='your_openai_api_key'
-    dataset_path = '/ephemeral/taremu/MarkLLM/dataset/advbench/advbench_subset.json'
-    process_prompt_dataset(dataset_path, num_prompts=20)
+    dataset_path = '/ephemeral/taremu/MarkLLM/dataset/aart/aart.json'
+    process_prompt_dataset(dataset_path, num_prompts=100)
 
     # dataset_path = ''
     # train_model(dataset_path=dataset_path, model_name='Qwen/Qwen2.5-1.5B', training_type='dpo')
